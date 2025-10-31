@@ -25,14 +25,66 @@ while 1:
     if not message:
         tcpCliSock.close()
         continue    
-
+    method = message.split()[0]
     # Extract the filename from the given message
     print(f"Original request: {message.split()[1]}")
     
     # We get the filename, e.g., www.google.com/images/logo.png
     filename = message.split()[1].partition("//")[2]
     print(f"Parsed filename: {filename}")
-    
+    if method == "POST":
+        print("Handling POST request...")
+        try:
+            hostn = filename.split('/')[0]
+            path_start = filename.find('/')
+            path = filename[path_start:] if path_start != -1 else "/"
+
+            # Connect to the target host
+            c = socket(AF_INET, SOCK_STREAM)
+            c.connect((hostn, 80))
+            print(f"Connected to {hostn}")
+
+            # Split headers and body
+            header_end = message.find("\r\n\r\n")
+            headers = message[:header_end]
+            body = message[header_end+4:] if header_end != -1 else ""
+
+            # Rebuild the request
+            header_lines = headers.split("\r\n")
+            new_request = f"POST {path} HTTP/1.0\r\n"
+            for line in header_lines[1:]:
+                if line.lower().startswith("proxy-connection"):
+                    continue
+                new_request += line + "\r\n"
+
+            if not any(line.lower().startswith("content-length") for line in header_lines):
+                new_request += f"Content-Length: {len(body)}\r\n"
+
+            new_request += "\r\n" + body
+
+            print(f"Forwarding POST request to {hostn}:\n{new_request}")
+
+            # Send the POST request to the host
+            c.sendall(new_request.encode())
+
+            # Receive and relay the response
+            response_buffer = b""
+            while True:
+                data = c.recv(4096)
+                if not data:
+                    break
+                response_buffer += data
+
+            print("---- POST Response ----")
+            print(response_buffer.decode(errors='ignore'))
+            print("---- End POST Response ----")
+
+            tcpCliSock.sendall(response_buffer)
+            c.close()
+        except Exception as e:
+            print(f"POST request error: {e}")
+        tcpCliSock.close()
+        continue  # Skip cache logic
     # === NEW FIX FOR DIRECTORY REQUESTS ===
     # If the request ends in a / or is just the host,
     # it's a directory request. Append 'index.html' to
