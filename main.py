@@ -1,195 +1,199 @@
 from socket import *
 import sys
-import os # Import the OS module to create directories
+import os
+import traceback
 
+# ===============================
+# CONFIGURATION
+# ===============================
+SERVER_PORT = 8888
+BUFFER_SIZE = 4096
+TIMEOUT = 10 
+CACHE_ROOT = "./"
+
+# ===============================
+# STARTUP
+# ===============================
 if len(sys.argv) <= 1:
-    print('Usage: "python ProxyServer.py server_ip"\n[server_ip: It is the IP Address Of Proxy Server')
+    print('Usage: "python ProxyServer.py server_ip"\n[server_ip: It is the IP Address Of Proxy Server]')
     sys.exit(2)
 
-# Create a server socket, bind it to a port and start listening
 tcpSerSock = socket(AF_INET, SOCK_STREAM)
 tcpSerSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 
-serverPort = 8888 
-tcpSerSock.bind((sys.argv[1], serverPort))
-tcpSerSock.listen(5)
+try:
+    tcpSerSock.bind((sys.argv[1], SERVER_PORT))
+    tcpSerSock.listen(5)
+    print(f"Proxy server started on {sys.argv[1]}:{SERVER_PORT}")
+except Exception as e:
+    print(f"Error starting proxy server: {e}")
+    sys.exit(1)
 
-while 1:
-    # Strat receiving data from the client
-    print('Ready to serve...')
-    tcpCliSock, addr = tcpSerSock.accept()
-    print('Received a connection from:', addr)
-    
-    message = tcpCliSock.recv(4096).decode()
+# ===============================
+# MAIN LOOP
+# ===============================
+while True:
+    try:
+        print('Ready to serve...')
+        tcpCliSock, addr = tcpSerSock.accept()
+        print('Received a connection from:', addr)
 
-    if not message:
-        tcpCliSock.close()
-        continue    
-    method = message.split()[0]
-    # Extract the filename from the given message
-    print(f"Original request: {message.split()[1]}")
-    
-    # We get the filename, e.g., www.google.com/images/logo.png
-    filename = message.split()[1].partition("//")[2]
-    print(f"Parsed filename: {filename}")
-    if method == "POST":
-        print("Handling POST request...")
+        try:
+            message = tcpCliSock.recv(BUFFER_SIZE).decode(errors="ignore")
+        except Exception as e:
+            print(f"Receive error: {e}")
+            tcpCliSock.close()
+            continue
+
+        if not message or len(message.split()) < 2:
+            print("Invalid or empty HTTP request.")
+            tcpCliSock.close()
+            continue
+
+        method = message.split()[0].upper()
+        url = message.split()[1]
+        print(f"{method} request for: {url}")
+
+        filename = url.partition("//")[2]
+        path_only = filename.partition('/')[2]
+        if filename.endswith('/'):
+            filetouse = os.path.join(CACHE_ROOT, filename, "index.html")
+        elif not path_only:
+            filetouse = os.path.join(CACHE_ROOT, filename, "index.html")
+        else:
+            filetouse = os.path.join(CACHE_ROOT, filename)
+
+        print(f"Cache file path: {filetouse}")
+
+        # ===============================
+        # SERVE FROM CACHE (for GET)
+        # ===============================
+        if method == "GET":
+            try:
+                with open(filetouse, "rb") as f:
+                    cached_response = f.read()
+                print("Cache hit: serving exact cached response.")
+                try:
+                    tcpCliSock.sendall(cached_response)
+                except BrokenPipeError:
+                    print("Client disconnected early (Broken pipe).")
+                tcpCliSock.close()
+                continue
+            except FileNotFoundError:
+                print("Cache miss: file not found locally.")
+            except Exception as e:
+                print(f"Error reading cache: {e}")
+
+        # ===============================
+        # FETCH FROM REMOTE SERVER
+        # ===============================
         try:
             hostn = filename.split('/')[0]
-            path_start = filename.find('/')
-            path = filename[path_start:] if path_start != -1 else "/"
+            if not hostn:
+                raise ValueError("Invalid or missing hostname in URL.")
 
-            # Connect to the target host
             c = socket(AF_INET, SOCK_STREAM)
+            c.settimeout(TIMEOUT)
+            print(f"Connecting to remote host: {hostn}")
             c.connect((hostn, 80))
             print(f"Connected to {hostn}")
 
-            # Split headers and body
-            header_end = message.find("\r\n\r\n")
-            headers = message[:header_end]
-            body = message[header_end+4:] if header_end != -1 else ""
+            headers, _, body = message.partition("\r\n\r\n")
+            headers_lines = headers.splitlines()
+            path_start = filename.find('/')
+            path = filename[path_start:] if path_start != -1 else "/"
 
-            # Rebuild the request
-            header_lines = headers.split("\r\n")
-            new_request = f"POST {path} HTTP/1.0\r\n"
-            for line in header_lines[1:]:
-                if line.lower().startswith("proxy-connection"):
-                    continue
-                new_request += line + "\r\n"
+            # Build proper request
+            request_lines = []
+            for line in headers_lines:
+                if line.startswith("GET") or line.startswith("POST"):
+                    request_lines.append(f"{method} {path} HTTP/1.0")
+                elif not line.lower().startswith("connection:"):
+                    request_lines.append(line)
+            request_lines.append("Connection: close")
+            request_data = "\r\n".join(request_lines) + "\r\n\r\n"
 
-            if not any(line.lower().startswith("content-length") for line in header_lines):
-                new_request += f"Content-Length: {len(body)}\r\n"
+            if method == "POST":
+                request_bytes = request_data.encode() + body.encode()
+            else:
+                request_bytes = request_data.encode()
 
-            new_request += "\r\n" + body
+            c.sendall(request_bytes)
+            print(f"Forwarded {method} request to {hostn}")
 
-            print(f"Forwarding POST request to {hostn}:\n{new_request}")
-
-            # Send the POST request to the host
-            c.sendall(new_request.encode())
-
-            # Receive and relay the response
+            # Receive response (full)
             response_buffer = b""
             while True:
-                data = c.recv(4096)
-                if not data:
-                    break
-                response_buffer += data
-
-            print("---- POST Response ----")
-            print(response_buffer.decode(errors='ignore'))
-            print("---- End POST Response ----")
-
-            tcpCliSock.sendall(response_buffer)
-            c.close()
-        except Exception as e:
-            print(f"POST request error: {e}")
-        tcpCliSock.close()
-        continue  # Skip cache logic
-    # === NEW FIX FOR DIRECTORY REQUESTS ===
-    # If the request ends in a / or is just the host,
-    # it's a directory request. Append 'index.html' to
-    # the filename so we save it as a file.
-    
-    # Check if the path part is empty or just a slash
-    path_only = filename.partition('/')[2]
-
-    if filename.endswith('/'):
-        filetouse = "./" + filename + "index.html"
-    elif not path_only: # Handles 'info.cern.ch' (no slash)
-         filetouse = "./" + filename + "/index.html"
-    else:
-        filetouse = "./" + filename
-    # =======================================
-    
-    print(f"File to use in cache: {filetouse}")
-    
-    fileExist = "false"
-    
-    try:
-        # Check wether the file exist in the cache
-        f = open(filetouse, "rb") # Open the file using the full path
-        outputdata = f.read()
-        fileExist = "true"
-        
-        # ProxyServer finds a cache hit and generates a response message
-        tcpCliSock.send("HTTP/1.0 200 OK\r\n".encode())
-        tcpCliSock.send("Content-Type: text/html\r\n".encode())
-        tcpCliSock.send("\r\n".encode())
-        tcpCliSock.send(outputdata)
-        f.close()
-        
-        print('Read from cache')
-    
-    # Error handling for file not found in cache
-    except IOError:
-        if fileExist == "false":
-            # Create a socket on the proxyserver
-            c = socket(AF_INET, SOCK_STREAM)     
-            try:
-                hostn = filename.split('/')[0]
-            except Exception:
-                print("Error: Invalid hostname in request.")
-                tcpCliSock.close()
-                continue
-                
-            print(f"Connecting to host: {hostn}")
-
-            try:
-                # Connect to the socket to port 80
-                c.connect((hostn, 80))     
-                print(f"Connected to {hostn}")
-                
-                # Re-format the request to be a standard relative request
-                # e.g., GET /images/logo.png HTTP/1.0
-                # We find the first '/' after the hostname
-                path_start = filename.find('/')
-                if path_start == -1:
-                    path = "/"
-                else:
-                    path = filename[path_start:]
-
-                request = f"GET {path} HTTP/1.0\r\n"
-                request += f"Host: {hostn}\r\n"
-                request += "Connection: close\r\n\r\n"
-                print(f"Forwarding request to host:\n{request}")
-                
-                c.send(request.encode())
-
-                response_buffer = b""
-                while True:
-                    data = c.recv(4096)
+                try:
+                    data = c.recv(BUFFER_SIZE)
                     if not data:
                         break
                     response_buffer += data
-                
-                # === CACHING FIX ===
-                # We must create the directories if they don't exist
-                # e.g., create "./www.google.com/images/"
+                except timeout:
+                    print(f"Timeout receiving from {hostn}")
+                    break
+                except Exception as e:
+                    print(f"Receive error: {e}")
+                    break
+
+            if not response_buffer:
+                print("No response from remote host.")
+                tcpCliSock.sendall(b"HTTP/1.0 502 Bad Gateway\r\n\r\n")
+                c.close()
+                tcpCliSock.close()
+                continue
+
+            # Cache only full GET responses
+            if method == "GET":
                 try:
-                    # Get the directory part of the path
                     directory = os.path.dirname(filetouse)
                     if directory:
-                        # exist_ok=True means it won't crash if dir exists
-                        os.makedirs(directory, exist_ok=True) 
-                        
-                    tmpFile = open(filetouse,"wb")
-                    tmpFile.write(response_buffer)
-                    tmpFile.close()
-                    print(f"Cached file to {filetouse}")
+                        os.makedirs(directory, exist_ok=True)
+                    with open(filetouse, "wb") as tmpFile:
+                        tmpFile.write(response_buffer)
+                    print(f"Cached new file: {filetouse}")
                 except Exception as e:
                     print(f"Error caching file: {e}")
-                # ===================
-                
-                tcpCliSock.send(response_buffer)
-                c.close()
 
+            try:
+                tcpCliSock.sendall(response_buffer)
+            except BrokenPipeError:
+                print("Client disconnected early (Broken pipe).")
             except Exception as e:
-                print(f"Connection Error: {e}")
-                tcpCliSock.send("HTTP/1.0 404 Not Found\r\n".encode())
-                tcpCliSock.send("\r\n".encode())
-                if 'c' in locals() and c.fileno() != -1:
+                print(f"Error sending response: {e}")
+
+            c.close()
+
+        except timeout:
+            print(f"Timeout connecting to {hostn}")
+            tcpCliSock.sendall(b"HTTP/1.0 504 Gateway Timeout\r\n\r\n")
+        except gaierror:
+            print(f"Unknown host: {filename}")
+            tcpCliSock.sendall(b"HTTP/1.0 404 Not Found\r\n\r\n")
+        except ConnectionRefusedError:
+            print(f"Connection refused by {hostn}")
+            tcpCliSock.sendall(b"HTTP/1.0 502 Bad Gateway\r\n\r\n")
+        except ValueError as e:
+            print(f"Invalid URL: {e}")
+            tcpCliSock.sendall(b"HTTP/1.0 400 Bad Request\r\n\r\n")
+        except Exception as e:
+            print(f"Unexpected fetch error: {e}")
+            traceback.print_exc()
+            tcpCliSock.sendall(b"HTTP/1.0 500 Internal Server Error\r\n\r\n")
+        finally:
+            if 'c' in locals():
+                try:
                     c.close()
-        else:
-            pass
-            
-    tcpCliSock.close()
+                except:
+                    pass
+
+        tcpCliSock.close()
+
+    except KeyboardInterrupt:
+        print("\nProxy server shutting down gracefully...")
+        tcpSerSock.close()
+        sys.exit(0)
+    except Exception as e:
+        print(f"Top-level error: {e}")
+        traceback.print_exc()
+        continue
