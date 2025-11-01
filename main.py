@@ -135,14 +135,16 @@ while True:
                 except Exception as e:
                     print(f"Receive error: {e}")
                     break
-
+            if method == "POST":
+                print("---- POST Response ----")
+                print(response_buffer.decode(errors='ignore'))
+                print("---- End POST Response ----")
             if not response_buffer:
                 print("No response from remote host.")
                 tcpCliSock.sendall(b"HTTP/1.0 502 Bad Gateway\r\n\r\n")
                 c.close()
                 tcpCliSock.close()
                 continue
-
             # Cache only full GET responses
             if method == "GET":
                 try:
